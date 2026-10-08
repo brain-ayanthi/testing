@@ -1,0 +1,5 @@
+[16-Nov-2025 09:55:37 Asia/Colombo] PHP Fatal error:  Uncaught PDOException: SQLSTATE[23000]: Integrity constraint violation: 1062 Duplicate entry '01' for key 'code' in /home2/tanvishl/public_html/TEACOLLECTGM10731/public/farmer_add.php:23
+Stack trace:
+#0 /home2/tanvishl/public_html/TEACOLLECTGM10731/public/farmer_add.php(23): PDOStatement->execute(Array)
+#1 {main}
+  thrown in /home2/tanvishl/public_html/TEACOLLECTGM10731/public/farmer_add.php on line 23

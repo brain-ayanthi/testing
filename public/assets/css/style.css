@@ -1,0 +1,4 @@
+body{font-family:Inter,Arial,Helvetica,sans-serif}
+.card{border-radius:8px}
+.navbar-brand{font-weight:600}
+@media(max-width:576px){ .card h2{font-size:1.25rem} }

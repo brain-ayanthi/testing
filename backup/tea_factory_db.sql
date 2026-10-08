@@ -1,0 +1,92 @@
+-- Database: tea_factory_db
+CREATE DATABASE IF NOT EXISTS tea_factory_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE tea_factory_db;
+
+CREATE TABLE users (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(150) NOT NULL,
+  email VARCHAR(150) UNIQUE NOT NULL,
+  password VARCHAR(255) NOT NULL,
+  roles VARCHAR(255) DEFAULT 'admin',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE areas (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(150) NOT NULL,
+  code VARCHAR(50),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE farmers (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  code VARCHAR(50) UNIQUE,
+  name VARCHAR(200) NOT NULL,
+  nic VARCHAR(50),
+  contact VARCHAR(50),
+  address TEXT,
+  area_id INT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (area_id) REFERENCES areas(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE collections (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  farmer_id INT NOT NULL,
+  collection_date DATE NOT NULL,
+  weight_kg DECIMAL(10,3) NOT NULL,
+  area_id INT,
+  agent_id INT,
+  bonus DECIMAL(10,2) DEFAULT 0,
+  deduction DECIMAL(10,2) DEFAULT 0,
+  advance_paid DECIMAL(10,2) DEFAULT 0,
+  payable_amount DECIMAL(12,2) DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (farmer_id) REFERENCES farmers(id) ON DELETE CASCADE,
+  FOREIGN KEY (area_id) REFERENCES areas(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE area_rates (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  area_id INT NOT NULL,
+  year_month VARCHAR(7) NOT NULL,
+  rate_per_kg DECIMAL(10,2) NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(area_id, year_month),
+  FOREIGN KEY (area_id) REFERENCES areas(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE advances (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  farmer_id INT NOT NULL,
+  amount DECIMAL(12,2) NOT NULL,
+  note VARCHAR(255),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  paid TINYINT(1) DEFAULT 0,
+  FOREIGN KEY (farmer_id) REFERENCES farmers(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE deductions (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  farmer_id INT NOT NULL,
+  amount DECIMAL(12,2) NOT NULL,
+  type VARCHAR(100),
+  note VARCHAR(255),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (farmer_id) REFERENCES farmers(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE payments (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  farmer_id INT NOT NULL,
+  period VARCHAR(7) NOT NULL,
+  total_collection DECIMAL(12,2) NOT NULL,
+  total_payable DECIMAL(12,2) NOT NULL,
+  saved_amount DECIMAL(12,2) DEFAULT 0,
+  paid_amount DECIMAL(12,2) DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (farmer_id) REFERENCES farmers(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE INDEX idx_col_date ON collections(collection_date);
+CREATE INDEX idx_farmer_area ON farmers(area_id);

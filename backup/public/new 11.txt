@@ -1,0 +1,947 @@
+<?php
+require_once __DIR__ . '/../init.php';
+require_login();
+
+/**
+ * payments.php
+ * - Filter: area, period (YYYY-MM), search (name/code)
+ * - Generate / Update payments for month (collections with status=0)
+ * - AJAX actions: generate_all, save_bag, agree, not_agree
+ * - Shows table with many computed columns and DataTables exports
+ */
+
+// --- helpers ---
+function json_exit($arr){
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode($arr);
+    exit;
+}
+
+// get inputs
+$period = $_REQUEST['period'] ?? date('Y-m');            // YYYY-MM
+$area_id = $_REQUEST['area_id'] ?? '';
+$search = trim($_REQUEST['search'] ?? '');
+$page = max(1, (int)($_GET['page'] ?? 1));
+$limit = 25;
+$offset = ($page - 1) * $limit;
+
+// Try to add bag_weight column to payments if missing (safe)
+try {
+    $colCheck = $pdo->query("SHOW COLUMNS FROM payments LIKE 'bag_weight'")->fetch();
+    if (!$colCheck) {
+        $pdo->exec("ALTER TABLE payments ADD COLUMN bag_weight DECIMAL(12,3) NOT NULL DEFAULT 0.000");
+    }
+} catch (Exception $e) {
+    // ignore - user may not have alter privileges; code will still work but bag_weight will be stored as 0
+}
+
+// ----------------- AJAX actions -----------------
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
+    $action = $_POST['action'];
+
+    // ---------- Generate/Update Payments for month ----------
+    if ($action === 'generate_all') {
+        $period = $_POST['period'] ?? $period; // needed
+        try {
+            $pdo->beginTransaction();
+
+            // fetch per-farmer totals for the month where status = 0 (unprocessed collections)
+            $stmt = $pdo->prepare("
+                SELECT c.farmer_id, f.area_id,
+                       SUM(c.weight_kg) AS total_wt
+                FROM collections c
+                JOIN farmers f ON c.farmer_id = f.id
+                WHERE DATE_FORMAT(c.collection_date, '%Y-%m') = :pm
+                  AND c.status = 0
+                GROUP BY c.farmer_id, f.area_id
+            ");
+            $stmt->execute([':pm' => $period]);
+            $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            // Also allow updating existing payments if new collections have arrived later:
+            // We'll recompute grand totals for farmer across *all* collections in that period
+            // (not just status=0) and update payments.total_collection/total_payable when needed.
+
+            // Prepare statements
+            $checkStmt = $pdo->prepare("SELECT id FROM payments WHERE farmer_id = :f AND period = :p LIMIT 1");
+            $insertStmt = $pdo->prepare("
+                INSERT INTO payments (farmer_id, period, total_collection, total_payable, saved_amount, paid_amount, created_at, bag_weight)
+                VALUES (:f,:p,:tc,:tp,0,0,NOW(),0)
+            ");
+            $updateStmt = $pdo->prepare("
+                UPDATE payments
+                SET total_collection = :tc, total_payable = :tp, updated_at = NOW()
+                WHERE farmer_id = :f AND period = :p
+            ");
+            $markCollections = $pdo->prepare("
+                UPDATE collections
+                SET status = 1
+                WHERE farmer_id = :f AND DATE_FORMAT(collection_date, '%Y-%m') = :pm
+            ");
+
+            // We'll need area_rates rate_per_kg for each farmer's area. We'll fetch inside loop.
+           $rateStmt = $pdo->prepare("SELECT `rate_per_kg` FROM `area_rates` WHERE `area_id` = :aid AND `year_month` = :pm LIMIT 1");
+
+
+            foreach ($rows as $r) {
+                $farmerId = (int)$r['farmer_id'];
+                $areaId = (int)$r['area_id'];
+
+                // recompute ALL collections for that farmer in period (so we always keep payments accurate)
+                $totStmt = $pdo->prepare("
+                    SELECT SUM(weight_kg) AS total_wt
+                    FROM collections
+                    WHERE farmer_id = :f AND DATE_FORMAT(collection_date, '%Y-%m') = :pm
+                ");
+                $totStmt->execute([':f'=>$farmerId, ':pm'=>$period]);
+                $totRow = $totStmt->fetch(PDO::FETCH_ASSOC);
+                $totalWeight = floatval($totRow['total_wt'] ?? 0);
+				
+				
+				
+
+                // get area rate
+                $rateStmt->execute([':aid'=>$areaId, ':pm'=>$period]);
+                $rrow = $rateStmt->fetch(PDO::FETCH_ASSOC);
+                $rate = $rrow ? floatval($rrow['rate_per_kg']) : 0.0;
+
+                // default bag_weight zero (may be filled later)
+                $bag_weight = 0.0;
+                $balance_weight = max(0, $totalWeight - $bag_weight);
+                $total_pay = round($balance_weight * $rate, 2);
+
+                // check exists
+                $checkStmt->execute([':f'=>$farmerId, ':p'=>$period]);
+                if ($checkStmt->rowCount() > 0) {
+                    $updateStmt->execute([':tc'=>$totalWeight, ':tp'=>$total_pay, ':f'=>$farmerId, ':p'=>$period]);
+                } else {
+                    $insertStmt->execute([':f'=>$farmerId, ':p'=>$period, ':tc'=>$totalWeight, ':tp'=>$total_pay]);
+                }
+
+                // mark processed collections
+                $markCollections->execute([':f'=>$farmerId, ':pm'=>$period]);
+            }
+
+            // commit
+            $pdo->commit();
+            json_exit(['status'=>true, 'message'=>'Payments generated/updated successfully.']);
+        } catch (Exception $e) {
+            $pdo->rollBack();
+            json_exit(['status'=>false, 'message'=>'Error: '.$e->getMessage()]);
+        }
+    }
+
+    // ---------- Save bag weight for a payment ----------
+    if ($action === 'save_bag') {
+        $payment_id = intval($_POST['payment_id'] ?? 0);
+        $bag_weight = floatval($_POST['bag_weight'] ?? 0);
+        if ($payment_id <= 0) json_exit(['status'=>false, 'message'=>'Invalid payment id']);
+
+        try {
+            // ensure bag_weight column exists (attempted earlier, but double-check)
+            $pdo->beginTransaction();
+            $pdo->prepare("UPDATE payments SET bag_weight = :bw, updated_at = NOW() WHERE id = :id")
+                ->execute([':bw'=>$bag_weight, ':id'=>$payment_id]);
+            $pdo->commit();
+            json_exit(['status'=>true, 'message'=>'Bag weight saved']);
+        } catch (Exception $e) {
+            $pdo->rollBack();
+            json_exit(['status'=>false, 'message'=>'Error saving bag weight: '.$e->getMessage()]);
+        }
+    }
+
+    // ---------- Agree (save 10%) ----------
+    if ($action === 'agree') {
+        $payment_id = intval($_POST['payment_id'] ?? 0);
+        if ($payment_id <= 0) json_exit(['status'=>false, 'message'=>'Invalid payment id']);
+
+        try {
+            $pdo->beginTransaction();
+
+            // load payment details (we need total_payable and farmer)
+            $p = $pdo->prepare("SELECT pay.*, f.code AS farmer_code, f.name AS farmer_name, f.area_id FROM payments pay JOIN farmers f ON pay.farmer_id=f.id WHERE pay.id = :id LIMIT 1");
+            $p->execute([':id'=>$payment_id]);
+            $pay = $p->fetch(PDO::FETCH_ASSOC);
+            if (!$pay) throw new Exception('Payment record not found');
+
+            $amount = round(floatval($pay['total_payable']) * 0.10, 2);
+
+            // check existing saving for this payment
+            $chk = $pdo->prepare("SELECT id FROM saving WHERE payment_id = :pid LIMIT 1");
+            $chk->execute([':pid'=>$payment_id]);
+            if ($chk->rowCount() > 0) {
+                // update
+                $pdo->prepare("UPDATE saving SET amount = :amt, status='agree', saving_date = CURDATE(), farmer_code = :fc, farmer_name = :fn WHERE payment_id = :pid")
+                    ->execute([':amt'=>$amount, ':fc'=>$pay['farmer_code'], ':fn'=>$pay['farmer_name'], ':pid'=>$payment_id]);
+            } else {
+                // insert
+                $pdo->prepare("INSERT INTO saving (payment_id, farmer_code, farmer_name, amount, status, saving_date) VALUES (:pid, :fc, :fn, :amt, 'agree', CURDATE())")
+                    ->execute([':pid'=>$payment_id, ':fc'=>$pay['farmer_code'], ':fn'=>$pay['farmer_name'], ':amt'=>$amount]);
+            }
+
+            // update payments.saved_amount
+            $pdo->prepare("UPDATE payments SET saved_amount = :amt WHERE id = :pid")
+                ->execute([':amt'=>$amount, ':pid'=>$payment_id]);
+
+            $pdo->commit();
+            json_exit(['status'=>true, 'message'=>'Saved amount (10%) applied']);
+        } catch (Exception $e) {
+            $pdo->rollBack();
+            json_exit(['status'=>false, 'message'=>'Error: '.$e->getMessage()]);
+        }
+    }
+
+    // ---------- Not agree (remove saving) ----------
+    if ($action === 'not_agree') {
+        $payment_id = intval($_POST['payment_id'] ?? 0);
+        if ($payment_id <= 0) json_exit(['status'=>false, 'message'=>'Invalid payment id']);
+        try {
+            $pdo->beginTransaction();
+            $pdo->prepare("DELETE FROM saving WHERE payment_id = :pid")->execute([':pid'=>$payment_id]);
+            $pdo->prepare("UPDATE payments SET saved_amount = 0 WHERE id = :pid")->execute([':pid'=>$payment_id]);
+            $pdo->commit();
+            json_exit(['status'=>true, 'message'=>'Saving removed']);
+        } catch (Exception $e) {
+            $pdo->rollBack();
+            json_exit(['status'=>false, 'message'=>'Error: '.$e->getMessage()]);
+        }
+		
+		
+    }
+
+
+// ---------- Festival Advance Payment Update ----------
+// ✅ FESTIVAL ADVANCE PAY (MERGED VERSION WITH PDO - MULTI RECORD DEDUCTION)
+if ($action === 'pay_advance') {
+	
+	$period = $_GET['period'] ?? date('Y-m');
+	
+    $farmer_id = intval($_POST['farmer_id'] ?? 0);
+    $pay_amount = floatval($_POST['pay_amount'] ?? 0);
+
+    if ($farmer_id <= 0 || $pay_amount <= 0) {
+        json_exit(['status' => false, 'message' => 'Invalid input']);
+    }
+
+    try {
+        $pdo->beginTransaction();
+
+        // ✅ Get unpaid festival advances (oldest first)
+        $advances = $pdo->prepare("
+            SELECT * FROM advances
+            WHERE farmer_id = :f 
+              AND status IN ('due','partial')
+            ORDER BY created_at ASC
+        ");
+        $advances->execute([':f' => $farmer_id]);
+        $rows = $advances->fetchAll(PDO::FETCH_ASSOC);
+
+        $remain = $pay_amount;
+
+        foreach ($rows as $adv) {
+            if ($remain <= 0) break;
+
+            $due = $adv['amount'] - $adv['paid'];
+            $toPay = min($remain, $due);
+            $newPaid = $adv['paid'] + $toPay;
+            $newStatus = ($newPaid >= $adv['amount']) ? 'paid' : 'partial';
+
+            // ✅ Update each advance record
+            $pdo->prepare("
+                UPDATE advances 
+                SET paid = :p, status = :s 
+                WHERE id = :id
+            ")->execute([
+                ':p' => $newPaid,
+                ':s' => $newStatus,
+                ':id' => $adv['id']
+            ]);
+
+            $remain -= $toPay;
+        }
+
+        // ✅ Save to f_advance_amount_pay (for transaction history)
+      $period = $_POST['period'] ?? date('Y-m'); // ensure we capture the selected month
+
+$period = $_POST['period'] ?? date('Y-m');  // ✅ Use form's period
+
+$insert = $pdo->prepare("
+    INSERT INTO f_advance_amount_pay 
+    (farmer_id, pay_amount, previous_balance, new_balance, pay_date)
+    VALUES (
+        :farmer_id, 
+        :pay_amount,
+        (SELECT COALESCE(SUM(amount - paid), 0) FROM advances WHERE farmer_id = :farmer_id),
+        (SELECT COALESCE(SUM(amount - paid), 0) FROM advances WHERE farmer_id = :farmer_id),
+        :pay_date
+    )
+");
+$insert->execute([
+    ':farmer_id' => $farmer_id,
+    ':pay_amount' => $pay_amount,
+    ':pay_date'   => $period // ✅ Save exactly YYYY-MM
+]);
+
+
+        $pdo->commit();
+        json_exit(['status' => true, 'message' => 'Advance payment updated successfully.']);
+
+    } catch (Exception $e) {
+        $pdo->rollBack();
+        json_exit(['status' => false, 'message' => 'Error updating advance: ' . $e->getMessage()]);
+    }
+}
+
+
+if ($action === 'pay_chemical') {
+
+    $farmer_id = intval($_POST['farmer_id'] ?? 0);
+    $pay_amount = floatval($_POST['pay_amount'] ?? 0);
+    $period = $_POST['period'] ?? date('Y-m');
+
+    if ($farmer_id <= 0 || $pay_amount <= 0) {
+        json_exit(['status' => false, 'message' => 'Invalid input']);
+    }
+
+    try {
+        $pdo->beginTransaction();
+
+        // ✅ Get unpaid chemical issues (oldest first)
+        $chems = $pdo->prepare("
+            SELECT * FROM chemical_issue
+            WHERE farmer_id = :f 
+              AND status IN ('due','partial')
+            ORDER BY issued_date ASC
+        ");
+        $chems->execute([':f' => $farmer_id]);
+        $rows = $chems->fetchAll(PDO::FETCH_ASSOC);
+
+        $remain = $pay_amount;
+
+        foreach ($rows as $chem) {
+            if ($remain <= 0) break;
+
+            $due = $chem['amount'] - $chem['paid'];
+            $toPay = min($remain, $due);
+            $newPaid = $chem['paid'] + $toPay;
+            $newStatus = ($newPaid >= $chem['amount']) ? 'paid' : 'partial';
+
+            $pdo->prepare("
+                UPDATE chemical_issue 
+                SET paid = :p, status = :s 
+                WHERE id = :id
+            ")->execute([
+                ':p' => $newPaid,
+                ':s' => $newStatus,
+                ':id' => $chem['id']
+            ]);
+
+            $remain -= $toPay;
+        }
+
+        // ✅ Save to history table
+        $insert = $pdo->prepare("
+            INSERT INTO f_chemical_pay 
+            (farmer_id, pay_amount, previous_balance, new_balance, pay_date)
+            VALUES (
+                :farmer_id,
+                :pay_amount,
+                (SELECT COALESCE(SUM(amount - paid), 0) FROM chemical_issue WHERE farmer_id = :farmer_id),
+                (SELECT COALESCE(SUM(amount - paid), 0) FROM chemical_issue WHERE farmer_id = :farmer_id),
+                :pay_date
+            )
+        ");
+        $insert->execute([
+            ':farmer_id' => $farmer_id,
+            ':pay_amount' => $pay_amount,
+            ':pay_date' => $period
+        ]);
+
+        $pdo->commit();
+        json_exit(['status' => true, 'message' => 'Chemical payments updated successfully.']);
+
+    } catch (Exception $e) {
+        $pdo->rollBack();
+        json_exit(['status' => false, 'message' => 'Error: ' . $e->getMessage()]);
+    }
+}
+
+
+if ($action === 'pay_others') {
+
+    $farmer_id = intval($_POST['farmer_id'] ?? 0);
+    $pay_amount = floatval($_POST['pay_amount'] ?? 0);
+    $period = $_POST['period'] ?? date('Y-m');
+
+    if ($farmer_id <= 0 || $pay_amount <= 0) {
+        json_exit(['status' => false, 'message' => 'Invalid input']);
+    }
+
+    try {
+        $pdo->beginTransaction();
+
+        // ✅ Get unpaid Others deductions
+        $others = $pdo->prepare("
+            SELECT * FROM others
+            WHERE farmer_id = :f 
+              AND status IN ('due','partial')
+            ORDER BY created_at ASC
+        ");
+        $others->execute([':f' => $farmer_id]);
+        $rows = $others->fetchAll(PDO::FETCH_ASSOC);
+
+        $remain = $pay_amount;
+
+        foreach ($rows as $oth) {
+            if ($remain <= 0) break;
+
+            $due = $oth['amount'] - $oth['paid'];
+            $toPay = min($remain, $due);
+            $newPaid = $oth['paid'] + $toPay;
+            $newStatus = ($newPaid >= $oth['amount']) ? 'paid' : 'partial';
+
+            $pdo->prepare("
+                UPDATE others 
+                SET paid = :p, status = :s 
+                WHERE id = :id
+            ")->execute([
+                ':p' => $newPaid,
+                ':s' => $newStatus,
+                ':id' => $oth['id']
+            ]);
+
+            $remain -= $toPay;
+        }
+
+        // ✅ Save payment history
+        $pdo->prepare("
+            INSERT INTO f_other_pay 
+            (farmer_id, pay_amount, previous_balance, new_balance, pay_date)
+            VALUES (
+                :farmer_id,
+                :pay_amount,
+                (SELECT COALESCE(SUM(amount - paid), 0) FROM others WHERE farmer_id = :farmer_id),
+                (SELECT COALESCE(SUM(amount - paid), 0) FROM others WHERE farmer_id = :farmer_id),
+                :pay_date
+            )
+        ")->execute([
+            ':farmer_id' => $farmer_id,
+            ':pay_amount' => $pay_amount,
+            ':pay_date'   => $period
+        ]);
+
+        $pdo->commit();
+        json_exit(['status' => true, 'message' => 'Other payments updated successfully.']);
+
+    } catch (Exception $e) {
+        $pdo->rollBack();
+        json_exit(['status' => false, 'message' => 'Error: ' . $e->getMessage()]);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+    // unknown action
+    json_exit(['status'=>false, 'message'=>'Unknown action']);
+}
+
+// ----------------- End AJAX actions -----------------
+
+// --- UI: Filtering + listing payments with computed columns ---
+
+// Fetch areas for filter
+$areas = $pdo->query("SELECT id, name FROM areas ORDER BY name")->fetchAll(PDO::FETCH_ASSOC);
+
+// Check pending collections count for current period (status=0)
+$chkCollectionsStmt = $pdo->prepare("
+    SELECT COUNT(*) FROM collections
+    WHERE DATE_FORMAT(collection_date, '%Y-%m') = :pm AND status = 0
+");
+$chkCollectionsStmt->execute([':pm' => $period]);
+$pendingCollectionsCount = (int)$chkCollectionsStmt->fetchColumn();
+$generateDisabled = ($pendingCollectionsCount === 0); // disable generate button if 0
+
+// Build WHERE for payments listing (filter by period they are for)
+$where = "WHERE pay.period = :period";
+$params = [':period'=>$period];
+
+if (!empty($area_id)) {
+    $where .= " AND f.area_id = :area_id";
+    $params[':area_id'] = $area_id;
+}
+if (!empty($search)) {
+    $where .= " AND (f.name LIKE :s OR f.code LIKE :s)";
+    $params[':s'] = "%$search%";
+}
+
+// Count total payments for pagination
+$countSql = "SELECT COUNT(*) FROM payments pay JOIN farmers f ON pay.farmer_id = f.id $where";
+$countStmt = $pdo->prepare($countSql);
+$countStmt->execute($params);
+$totalRows = (int)$countStmt->fetchColumn();
+$totalPages = max(1, ceil($totalRows / $limit));
+
+// Fetch paginated payments
+$sql = "
+    SELECT pay.*, f.code AS farmer_code, f.name AS farmer_name, f.area_id
+    FROM payments pay
+    JOIN farmers f ON pay.farmer_id = f.id
+    $where
+    ORDER BY f.name ASC
+    LIMIT :limit OFFSET :offset
+";
+$stmt = $pdo->prepare($sql);
+foreach ($params as $k=>$v) $stmt->bindValue($k, $v);
+$stmt->bindValue(':limit', (int)$limit, PDO::PARAM_INT);
+$stmt->bindValue(':offset', (int)$offset, PDO::PARAM_INT);
+$stmt->execute();
+$payments = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+// We'll compute additional columns per payment: bag_weight (from payments), balance_weight, rate, total_pay, tea_bag_sum, advances_sum, chemical_sum, others_sum, balance, status, saved_amount etc.
+// Prepare statements to fetch sums quickly (single queries per farmer)
+$teaBagStmt = $pdo->prepare("SELECT COALESCE(SUM(subtotal),0) AS s FROM tea_bag_issues WHERE farmer_id = :f AND DATE_FORMAT(issue_date, '%Y-%m') = :pm");
+
+
+// Festival Advance logic (includes carried balances)
+$advStmt = $pdo->prepare("
+    SELECT 
+        COALESCE(SUM(amount),0) AS total_adv,
+        COALESCE(SUM(paid),0) AS total_paid
+    FROM advances
+    WHERE farmer_id = :f 
+      AND (DATE_FORMAT(created_at, '%Y-%m') <= :pm) 
+      AND status IN ('due','partial')
+");
+
+
+$chemStmt = $pdo->prepare("SELECT COALESCE(SUM(subtotal),0) AS s FROM chemical_issue WHERE farmer_id = :f AND DATE_FORMAT(issue_date, '%Y-%m') = :pm");
+$otherStmt = $pdo->prepare("SELECT COALESCE(SUM(amount),0) AS s FROM others WHERE farmer_id = :f AND DATE_FORMAT(issue_date, '%Y-%m') = :pm");
+$rateStmt = $pdo->prepare("SELECT `rate_per_kg` FROM `area_rates` WHERE `area_id` = :aid AND `year_month` = :pm LIMIT 1");
+$advancePaidStmt = $pdo->prepare("SELECT COALESCE(SUM(advance_paid),0) AS s FROM collections WHERE farmer_id = :f AND DATE_FORMAT(collection_date, '%Y-%m') = :pm");
+
+// We'll also pick saving status/amount from saving table
+$savingStmt = $pdo->prepare("SELECT amount, status FROM saving WHERE payment_id = :pid LIMIT 1");
+
+// Collect rows with computed fields
+$computed = [];
+foreach ($payments as $p) {
+    $farmer_id = (int)$p['farmer_id'];
+    $areaId = (int)$p['area_id'];
+    $total_collection = floatval($p['total_collection']);
+    $bag_weight = floatval($p['bag_weight'] ?? 0.0);
+    $balance_weight = max(0, $total_collection - $bag_weight);
+
+    // area rate
+    $rateStmt->execute([':aid'=>$areaId, ':pm'=>$period]);
+    $rrow = $rateStmt->fetch(PDO::FETCH_ASSOC);
+    $rate = $rrow ? floatval($rrow['rate_per_kg']) : 0.0;
+    $total_pay = round($balance_weight * $rate, 2);
+
+    // other sums
+    $teaBagStmt->execute([':f'=>$farmer_id, ':pm'=>$period]); $tea_bag_sum = floatval($teaBagStmt->fetchColumn());
+    $advStmt->execute([':f'=>$farmer_id, ':pm'=>$period]);
+$advRow = $advStmt->fetch(PDO::FETCH_ASSOC);
+$adv_amount = floatval($advRow['total_adv']);
+$adv_paid = floatval($advRow['total_paid']);
+$adv_balance = max(0, $adv_amount - $adv_paid);
+    
+	
+	
+	$chemStmt->execute([':f'=>$farmer_id, ':pm'=>$period]); $chem_sum = floatval($chemStmt->fetchColumn());
+    $otherStmt->execute([':f'=>$farmer_id, ':pm'=>$period]); $other_sum = floatval($otherStmt->fetchColumn());
+
+$advancePaidStmt->execute([':f'=>$farmer_id, ':pm'=>$period]);
+$advance_paid = floatval($advancePaidStmt->fetchColumn());
+
+
+
+    // saving
+    $savingStmt->execute([':pid'=>$p['id']]);
+    $saveRow = $savingStmt->fetch(PDO::FETCH_ASSOC);
+    $saved_amount = $saveRow ? floatval($saveRow['amount']) : floatval($p['saved_amount'] ?? 0);
+
+    // paid amount from payments table
+    $paid_amount = floatval($p['paid_amount'] ?? 0);
+
+    // balance = Total Pay - (saving + tea bag + advances + chemical + others)
+$balance = round($total_pay - ($saved_amount + $tea_bag_sum + $chem_sum + $other_sum + $advance_paid), 2);
+
+
+
+    // status: paid if paid_amount >= total_pay? else unpaid/partial (use payments.status if exists)
+    $status = ($paid_amount >= $total_pay && $total_pay > 0) ? 'Paid' : 'Unpaid';
+    // but respect payments.status if present
+    if (isset($p['status']) && intval($p['status']) === 1) $status = 'Paid';
+
+    $computed[] = array_merge($p, [
+        'rate'=>$rate,
+        'balance_weight'=>$balance_weight,
+        'total_pay'=>$total_pay,
+        'tea_bag_sum'=>$tea_bag_sum,
+        
+	
+    // ✅ Advance
+    'adv_sum'           => $adv_amount,
+    'adv_paid'          => $adv_paid ?? 0,
+    'adv_balance'       => ($adv_amount - $adv_paid) ?? 0,
+
+    // ✅ Chemical
+    'chem_sum'          => $chem_sum,                // Total chemical issue
+    'chem_paid'         => $chem_paid ?? 0,          // Chemical paid amount
+    'chem_balance'      => ($chem_sum - $chem_paid) ?? 0,  // Remaining
+
+    // ✅ Others
+    'other_sum'         => $other_sum,               // Total other deductions
+    'other_paid'        => $other_paid ?? 0,         // Others paid
+    'other_balance'     => ($other_sum - $other_paid) ?? 0, // Remaining
+
+		
+        'chem_sum'=>$chem_sum,
+        'other_sum'=>$other_sum,
+		'advance_paid'=>$advance_paid,
+        'saved_amount'=>$saved_amount,
+        'balance'=>$balance,
+        'paid_amount'=>$paid_amount,
+        'status_label'=>$status
+    ]);
+}
+
+// For highlighting duplicates (same farmer code/name in same month), we need to find farmers with multiple payment rows in this resultset (or for the period)
+// We'll build a map for counts for current period (not just page)
+$dupStmt = $pdo->prepare("SELECT farmer_id, COUNT(*) AS cnt FROM payments WHERE period = :pm GROUP BY farmer_id HAVING cnt > 1");
+$dupStmt->execute([':pm'=>$period]);
+$dups = $dupStmt->fetchAll(PDO::FETCH_ASSOC);
+$dupMap = [];
+foreach ($dups as $d) $dupMap[$d['farmer_id']] = $d['cnt'];
+
+// --- Render HTML ---
+?>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Payments</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdn.datatables.net/1.13.7/css/dataTables.bootstrap5.min.css" rel="stylesheet">
+<link href="https://cdn.datatables.net/buttons/2.4.2/css/buttons.bootstrap5.min.css" rel="stylesheet">
+<style>
+.table .dup { background:#ffdddd; } /* duplicate highlight */
+.small-input { width:100px; display:inline-block; }
+</style>
+</head>
+<body>
+<?php include 'partials/topnav.php'; ?>
+
+<div class="container mt-4">
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h4 class="fw-bold text-primary">Payments - <?= htmlspecialchars($period) ?></h4>
+    <a href="payments.php" class="btn btn-outline-secondary">Reset</a>
+  </div>
+
+  <?php if (!empty($errorMsg)): ?>
+    <div class="alert alert-danger"><?= htmlspecialchars($errorMsg) ?></div>
+  <?php endif; ?>
+
+  <!-- Filters -->
+  <form class="row g-2 mb-3" method="get">
+    <div class="col-md-2">
+      <input name="period" class="form-control" value="<?= htmlspecialchars($period) ?>" placeholder="YYYY-MM">
+    </div>
+    <div class="col-md-3">
+      <select name="area_id" class="form-select">
+        <option value="">All Areas</option>
+        <?php foreach ($areas as $ar): ?>
+          <option value="<?= $ar['id'] ?>" <?= $area_id == $ar['id'] ? 'selected' : '' ?>><?= htmlspecialchars($ar['name']) ?></option>
+        <?php endforeach; ?>
+      </select>
+    </div>
+    <div class="col-md-3">
+      <input name="search" class="form-control" value="<?= htmlspecialchars($search) ?>" placeholder="Farmer name or code">
+    </div>
+    <div class="col-md-2">
+      <button class="btn btn-primary w-100">Filter</button>
+    </div>
+    <div class="col-md-2">
+      <button type="button" id="generateBtn" class="btn btn-lg btn-success w-100" <?= $generateDisabled ? 'disabled' : '' ?>>Generate / Update Payments</button>
+    </div>
+  </form>
+
+  <div class="mb-2 text-muted">Pending collections for <?= htmlspecialchars($period) ?>: <strong><?= $pendingCollectionsCount ?></strong></div>
+
+  <div class="table-responsive">
+    <table id="paymentsTable" class="table table-sm table-bordered table-hover">
+      <thead class="table-light text-center">
+        <tr>
+          <th>Area</th>
+          <th>Farmer Code</th>
+          <th>Farmer Name</th>
+          <th>Total Kg</th>
+          <th>Bag Weight (kg)</th>
+          <th>Balance Kg</th>
+          <th>Rate (Rs/kg)</th>
+          <th>Total Pay (Rs)</th>
+          <th>Savings Status</th>
+          <th>Savings (10%)</th>
+		  <th>Advance Paid (Rs)</th>
+          <th>Tea Bag (Rs)</th>
+          <th>F / Advance (Rs)</th>
+          <th>Chemical (Rs)</th>
+          <th>Others (Rs)</th>
+		  <th>Balance (Rs)</th>
+          <th>Paid (Rs)</th>
+          <th>Status</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        <?php foreach ($computed as $row): 
+            $isDup = isset($dupMap[$row['farmer_id']]);
+            ?>
+        <tr class="<?= $isDup ? 'dup' : '' ?>">
+          <td><?= htmlspecialchars($row['area_name'] ?? '-') ?></td>
+          <td><?= htmlspecialchars($row['farmer_code']) ?></td>
+          <td><?= htmlspecialchars($row['farmer_name']) ?></td>
+          <td class="text-end"><?= number_format($row['total_collection'],2) ?></td>
+
+          <td class="text-center">
+            <input type="number" step="0.001" class="form-control form-control-sm text-end bag-input" data-payment="<?= $row['id'] ?>" value="<?= number_format($row['bag_weight'] ?? 0,3) ?>">
+            <button class="btn btn-sm btn-outline-primary mt-1 save-bag" data-payment="<?= $row['id'] ?>">Save</button>
+          </td>
+
+          <td class="text-end"><?= number_format($row['balance_weight'],3) ?></td>
+          <td class="text-end"><?= number_format($row['rate'],2) ?></td>
+          <td class="text-end"><?= number_format($row['total_pay'],2) ?></td>
+
+          <td class="text-center">
+            <button class="btn btn-sm btn-outline-success agree-btn" data-payment="<?= $row['id'] ?>" <?= ($row['saved_amount']>0)?'disabled':'' ?>>Agree</button>
+            <button class="btn btn-sm btn-outline-danger notagree-btn" data-payment="<?= $row['id'] ?>" <?= ($row['saved_amount']>0)?'':'disabled' ?>>NotAgree</button>
+          </td>
+
+          <td class="text-end saved-amount"><?= number_format($row['saved_amount'],2) ?></td>
+         
+	  <td class="text-end"><?= number_format($row['advance_paid'],2) ?></td>
+		 <td class="text-end"><?= number_format($row['tea_bag_sum'],2) ?></td>
+        
+		
+	<td class="text-center">
+  <input type="number" step="0.01" 
+         class="form-control form-control-sm text-end adv-paid-input" 
+         data-farmer="<?= $row['farmer_id'] ?>" 
+         value="<?= number_format($row['adv_sum'],2) ?>"> <!-- total advance -->
+  <small class="text-muted">Balance: <?= number_format($row['adv_balance'],2) ?></small>
+  <button class="btn btn-sm btn-outline-primary mt-1 pay-adv-btn" 
+          data-farmer="<?= $row['farmer_id'] ?>">Pay</button>
+</td>
+
+<!-- ✅ Chemical Issue Payment -->
+<td class="text-center">
+  <input type="number" step="0.01" 
+         class="form-control form-control-sm text-end chem-paid-input" 
+         data-farmer="<?= $row['farmer_id'] ?>" 
+         value="<?= number_format($row['chem_sum'],2) ?>"><!-- Chemical -->
+<small class="text-muted">Balance: <?= number_format($row['chem_balance'] ?? 0, 2) ?></small>
+  <button class="btn btn-sm btn-outline-warning mt-1 pay-chem-btn" 
+          data-farmer="<?= $row['farmer_id'] ?>">Pay</button>
+</td>
+
+<!-- ✅ Others Payment Section -->
+<td class="text-center">
+  <input type="number" step="0.01" 
+         class="form-control form-control-sm text-end other-paid-input" 
+         data-farmer="<?= $row['farmer_id'] ?>" 
+         value="<?= number_format($row['other_sum'],2) ?>">
+ <small class="text-muted">Balance: <?= number_format($row['other_balance'] ?? 0, 2) ?></small> 
+ <button class="btn btn-sm btn-outline-danger mt-1 pay-other-btn" 
+          data-farmer="<?= $row['farmer_id'] ?>">Pay</button>
+</td>		
+		
+		
+		
+         
+          <td class="text-end"><?= number_format($row['balance'],2) ?></td>
+          <td class="text-end"><?= number_format($row['paid_amount'],2) ?></td>
+          <td class="text-center"><span class="badge bg-<?= strtolower($row['status_label'])=='paid' ? 'success' : 'warning' ?>"><?= htmlspecialchars($row['status_label']) ?></span></td>
+          <td class="text-center">
+            <a href="payment_view.php?id=<?= $row['id'] ?>" class="btn btn-sm btn-primary">Pay</a>
+            <a href="payment_slip.php?id=<?= $row['id'] ?>" class="btn btn-sm btn-secondary">Slip</a>
+          </td>
+        </tr>
+        <?php endforeach; ?>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Pagination -->
+  <?php if ($totalPages > 1): ?>
+  <nav>
+    <ul class="pagination justify-content-center mt-3">
+      <?php for ($i=1;$i<=$totalPages;$i++): ?>
+        <li class="page-item <?= $i==$page ? 'active' : '' ?>"><a class="page-link" href="?page=<?= $i ?>&period=<?= urlencode($period) ?>&area_id=<?= urlencode($area_id) ?>&search=<?= urlencode($search) ?>"><?= $i ?></a></li>
+      <?php endfor; ?>
+    </ul>
+  </nav>
+  <?php endif; ?>
+
+</div>
+
+<!-- JS libs -->
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.7/js/jquery.dataTables.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.7/js/dataTables.bootstrap5.min.js"></script>
+<script src="https://cdn.datatables.net/buttons/2.4.2/js/dataTables.buttons.min.js"></script>
+<script src="https://cdn.datatables.net/buttons/2.4.2/js/buttons.bootstrap5.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.2.7/pdfmake.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.2.7/vfs_fonts.js"></script>
+<script src="https://cdn.datatables.net/buttons/2.4.2/js/buttons.html5.min.js"></script>
+
+<script>
+$(function(){
+
+  // Init DataTable for export features (no reorder/sort needed but helpful)
+  $('#paymentsTable').DataTable({
+    paging: false,
+    searching: false,
+    info: false,
+    dom: 'Bfrtip',
+    buttons: [
+      { extend: 'excelHtml5', className: 'btn btn-success btn-sm', text: 'Export Excel' },
+      { extend: 'pdfHtml5', className: 'btn btn-danger btn-sm', text: 'Export PDF' }
+    ]
+  });
+
+  // Generate button
+  $('#generateBtn').on('click', function(){
+    if(!confirm('Generate/Update payments for <?= $period ?>? This will mark collections status=1 for processed farmers.')) return;
+    const btn = $(this).prop('disabled', true).text('Processing...');
+    $.post('', { action: 'generate_all', period: '<?= $period ?>' }, function(res){
+      if(res.status){
+        alert(res.message);
+        location.reload();
+      } else {
+        alert(res.message || 'Failed.');
+        btn.prop('disabled', false).text('Generate / Update Payments');
+      }
+    }, 'json').fail(function(){ alert('Server error'); btn.prop('disabled', false).text('Generate / Update Payments'); });
+  });
+
+  // Save bag weight
+  $(document).on('click', '.save-bag', function(){
+    const id = $(this).data('payment');
+    const input = $(this).closest('td').find('.bag-input');
+    const val = parseFloat(input.val()) || 0;
+    const btn = $(this);
+    btn.prop('disabled', true).text('Saving...');
+    $.post('', { action: 'save_bag', payment_id: id, bag_weight: val }, function(res){
+      alert(res.message);
+      if(res.status) location.reload();
+      else btn.prop('disabled', false).text('Save');
+    }, 'json').fail(()=>{ alert('Server error'); btn.prop('disabled', false).text('Save'); });
+  });
+
+  // Agree (save 10%)
+  $(document).on('click', '.agree-btn', function(){
+    const id = $(this).data('payment');
+    if(!confirm('Agree saving of 10% for this farmer?')) return;
+    const btn = $(this);
+    btn.prop('disabled', true).text('Saving...');
+    $.post('', { action: 'agree', payment_id: id }, function(res){
+      alert(res.message);
+      if(res.status) location.reload();
+      else btn.prop('disabled', false).text('Agree');
+    }, 'json').fail(()=>{ alert('Server error'); btn.prop('disabled', false).text('Agree'); });
+  });
+
+  // Not agree (remove saving)
+  $(document).on('click', '.notagree-btn', function(){
+    const id = $(this).data('payment');
+    if(!confirm('Remove saving for this farmer?')) return;
+    const btn = $(this);
+    btn.prop('disabled', true).text('Removing...');
+    $.post('', { action: 'not_agree', payment_id: id }, function(res){
+      alert(res.message);
+      if(res.status) location.reload();
+      else btn.prop('disabled', false).text('NotAgree');
+    }, 'json').fail(()=>{ alert('Server error'); btn.prop('disabled', false).text('NotAgree'); });
+  });
+
+});
+
+// Handle Festival Advance Payment
+
+// ✅ Advance Pay
+$('.pay-adv-btn').click(function(){
+    var farmer = $(this).data('farmer');
+    var amount = $(this).closest('td').find('.adv-paid-input').val();
+    var period = $('input[name="period"]').val(); // ✅ Get period
+
+    $.post('payments.php', {
+        action: 'pay_advance',
+        farmer_id: farmer,
+        pay_amount: amount,
+        period: period
+    }, function(res){
+        if(res.status){
+            alert('Advance Paid Successfully!');
+            location.reload();
+        } else {
+            alert(res.message);
+        }
+    }, 'json');
+});
+
+
+// ✅ Chemical Pay
+$('.pay-chem-btn').click(function(){
+    var farmer = $(this).data('farmer');
+    var amount = $(this).closest('td').find('.chem-paid-input').val();
+    var period = $('input[name="period"]').val(); // ✅ Same format
+
+    $.post('payments.php', {
+        action: 'pay_chemical',
+        farmer_id: farmer,
+        pay_amount: amount,
+        period: period
+    }, function(res){
+        if(res.status){
+            alert('Chemical Payment Success!');
+            location.reload();
+        } else {
+            alert(res.message);
+        }
+    }, 'json');
+});
+
+
+// ✅ Others Pay
+$('.pay-other-btn').click(function(){
+    var farmer = $(this).data('farmer');
+    var amount = $(this).closest('td').find('.other-paid-input').val();
+    var period = $('input[name="period"]').val(); // ✅ Same format
+
+    $.post('payments.php', {
+        action: 'pay_others',
+        farmer_id: farmer,
+        pay_amount: amount,
+        period: period
+    }, function(res){
+        if(res.status){
+            alert('Other Payment Success!');
+            location.reload();
+        } else {
+            alert(res.message);
+        }
+    }, 'json');
+});
+
+
+</script>
+</body>
+</html>
